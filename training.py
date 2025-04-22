@@ -13,6 +13,9 @@ import pickle
 from collections import Counter
 from tqdm import tqdm # For progress bars
 
+# at the top of your training script, after imports
+# torch.autograd.set_detect_anomaly(True)
+
 # --- Constants and Configuration ---
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -34,21 +37,30 @@ UNKNOWN_TOKEN = "<unk>"
 
 # --- Model Hyperparameters (EXAMPLES - TUNE THESE!) ---
 VOCAB_SIZE = -1 # Will be determined after building vocabulary
-EMB_SIZE = 512
-NHEAD = 8
-NUM_LAYERS = 6
-FFN_HID_DIM = 2048
+# EMB_SIZE = 512
+# NHEAD = 8
+# NUM_LAYERS = 6
+# FFN_HID_DIM = 2048
 DROPOUT = 0.1
-MAX_SEQ_LEN = 1024 # Max sequence length the model can handle
+# MAX_SEQ_LEN = 1024 # Max sequence length the model can handle
+
 
 # --- Training Hyperparameters (EXAMPLES - TUNE THESE!) ---
-LR = 5e-6
-BATCH_SIZE = 16 # Adjust based on GPU memory
+# LR = 5e-6
+# BATCH_SIZE = 16 # Adjust based on GPU memory
 NUM_EPOCHS = 50
 CLIP_GRAD = 0.5 # Gradient clipping value
 
+NUM_LAYERS = 4 # Start with 4 instead of 6?
+EMB_SIZE   = 512
+NHEAD      = 8
+FFN_HID_DIM= 2048
+MAX_SEQ_LEN= 512 # Maybe keep slightly shorter for now?
+BATCH_SIZE = 16
+LR         = 5e-5 # Use the increased LR
+
 # --- Data Paths ---
-DATASET_ROOT = './ProcessedDataset' # <<< CHANGE THIS
+DATASET_ROOT = './newDataset' # <<< CHANGE THIS
 TOKENIZER_PATH = 'tokenizer.pkl'
 MODEL_SAVE_PATH = 'music_transformer_model.pth'
 
@@ -419,24 +431,31 @@ class MusicTransformerDecoder(nn.Module):
         # src shape: [batch_size, seq_len]
         # tgt_mask: [seq_len, seq_len] (causal mask)
         # src_padding_mask: [batch_size, seq_len] (True where padded)
-        try:
-            src_emb_tokens = self.token_embedding(src)
-            if torch.isnan(src_emb_tokens).any() or torch.isinf(src_emb_tokens).any():
-                print("\nCRITICAL WARNING: NaN/Inf detected in TOKEN EMBEDDINGS!")
-                # Find which input tokens caused this
-                problematic_batch_indices, problematic_seq_indices = torch.where(torch.isnan(src_emb_tokens).any(dim=-1) | torch.isinf(src_emb_tokens).any(dim=-1))
-                if len(problematic_batch_indices) > 0:
-                        print(f"Problematic input token IDs at first problematic position ({problematic_batch_indices[0]}, {problematic_seq_indices[0]}): {src[problematic_batch_indices[0], problematic_seq_indices[0]]}")
-                # Depending on severity, you might want to raise an error here
-        except IndexError as e:
-            print(f"\nCRITICAL ERROR: IndexError during embedding lookup! Likely invalid token index in src.")
-            print(f"Input (src) shape: {src.shape}, Max index in src: {src.max()}, Min index in src: {src.min()}")
-            raise e # Reraise the error
-        src_emb = self.positional_encoding(self.token_embedding(src))
-        # src_emb shape: [batch_size, seq_len, emb_size]
+        # try:
+        #     src_emb_tokens = self.token_embedding(src)
+        #     if torch.isnan(src_emb_tokens).any() or torch.isinf(src_emb_tokens).any():
+        #         print("\nCRITICAL WARNING: NaN/Inf detected in TOKEN EMBEDDINGS!")
+        #         # Find which input tokens caused this
+        #         problematic_batch_indices, problematic_seq_indices = torch.where(torch.isnan(src_emb_tokens).any(dim=-1) | torch.isinf(src_emb_tokens).any(dim=-1))
+        #         if len(problematic_batch_indices) > 0:
+        #                 print(f"Problematic input token IDs at first problematic position ({problematic_batch_indices[0]}, {problematic_seq_indices[0]}): {src[problematic_batch_indices[0], problematic_seq_indices[0]]}")
+        #         # Depending on severity, you might want to raise an error here
+        # except IndexError as e:
+        #     print(f"\nCRITICAL ERROR: IndexError during embedding lookup! Likely invalid token index in src.")
+        #     print(f"Input (src) shape: {src.shape}, Max index in src: {src.max()}, Min index in src: {src.min()}")
+        #     raise e # Reraise the error
+        # src_emb = self.positional_encoding(self.token_embedding(src))
+        # # src_emb shape: [batch_size, seq_len, emb_size]
+        # if torch.isnan(src_emb).any() or torch.isinf(src_emb).any():
+        #     print("\nCRITICAL WARNING: NaN/Inf detected AFTER POSITIONAL ENCODING!")
+        #     # This suggests the positional encoding math might be unstable, or embeddings were already bad
+
+        # single embedding lookup
+        src_emb = self.token_embedding(src)
         if torch.isnan(src_emb).any() or torch.isinf(src_emb).any():
-            print("\nCRITICAL WARNING: NaN/Inf detected AFTER POSITIONAL ENCODING!")
-            # This suggests the positional encoding math might be unstable, or embeddings were already bad
+            raise ValueError(f"NaN/Inf in token embeddings: indices {torch.unique(src[src_emb.isnan().any(dim=-1)])}")
+        # then positional‐encode
+        src_emb = self.positional_encoding(src_emb)
 
         # --- ADD ACTIVATION STATS CHECK ---
         print(f"\nDEBUG (Forward Pass): Stats for src_emb before TransformerDecoder:")
@@ -449,14 +468,52 @@ class MusicTransformerDecoder(nn.Module):
         # The tgt_mask ensures causality.
         # memory_key_padding_mask handles padding in the "memory" (which is src itself)
         # tgt_key_padding_mask handles padding in the target sequence during self-attention
-        output = self.transformer_decoder(tgt=src_emb, memory=src_emb, # Use src_emb as memory
-                                          tgt_mask=tgt_mask,
-                                          memory_mask=None, # No memory mask needed if memory=target
-                                          tgt_key_padding_mask=src_padding_mask,
-                                          memory_key_padding_mask=src_padding_mask)
+        # output = self.transformer_decoder(tgt=src_emb, memory=src_emb, # Use src_emb as memory
+        #                                   tgt_mask=tgt_mask,
+        #                                   memory_mask=None, # No memory mask needed if memory=target
+        #                                   tgt_key_padding_mask=src_padding_mask,
+        #                                   memory_key_padding_mask=src_padding_mask)
         # output shape: [batch_size, seq_len, emb_size]
 
+        x = src_emb
+        for i, layer in enumerate(self.transformer_decoder.layers):
+            # 1) Pre‑norm:
+            normed = layer.norm1(x)       # because you used norm_first=True
+
+            # 2) Self‑attention
+            attn_out, _ = layer.self_attn(
+                normed, normed, normed,
+                attn_mask=tgt_mask,
+                key_padding_mask=src_padding_mask
+            )
+            x1 = x + layer.dropout(attn_out)   # residual
+            # print(f"[L{i}] After MHA: min={x1.min():.4f}, max={x1.max():.4f}, std={x1.std():.4f}")
+
+            # 3) Feed‑forward
+            normed2 = layer.norm2(x1)
+            ffn_inter = layer.linear1(normed2)
+            ffn_act   = layer.activation(ffn_inter)
+            ffn_out   = layer.linear2(ffn_act)
+            x2 = x1 + layer.dropout(ffn_out)   # residual
+            # print(f"[L{i}] After FFN: min={x2.min():.4f}, max={x2.max():.4f}, std={x2.std():.4f}")
+
+            if torch.isnan(x2).any():
+                raise RuntimeError(f"NaNs in block {i} — {'MHA' if torch.isnan(x1).any() else 'FFN'}")
+            x = x2
+
+        output = x
         logits = self.output_linear(output)
+
+
+        # right after `logits = self.output_linear(output)` in forward/train loop
+        print(f"  [DEBUG] logits stats — min {logits.min().item():.4f}, max {logits.max().item():.4f}, "
+            f"mean {logits.mean().item():.4f}, std {logits.std().item():.4f}")
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            idx = torch.where(torch.isnan(logits) | torch.isinf(logits))
+            b, t, v = idx[0][0], idx[1][0], idx[2][0]
+            print(f"  [DEBUG] first bad at batch {b}, time‑step {t}, vocab‑dim {v}")
+            print("  [DEBUG] src token at that pos:", src[b, t].item(), id_to_token[src[b, t].item()])
+            raise RuntimeError("Found NaN/Inf in logits — aborting")
         # logits shape: [batch_size, seq_len, num_tokens]
         return logits
 
@@ -465,6 +522,15 @@ class MusicTransformerDecoder(nn.Module):
         mask = (torch.triu(torch.ones((sz, sz), device=DEVICE)) == 1).transpose(0, 1)
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
+
+
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.Embedding):
+        nn.init.xavier_uniform_(m.weight)
 
 
 # --- Training Function ---
@@ -499,6 +565,10 @@ def train_epoch(model, dataloader, optimizer, criterion, pad_idx, clip_value):
         tgt_mask = model.generate_square_subsequent_mask(seq_len).to(DEVICE)
         src_padding_mask = (src == pad_idx)
 
+        print(tgt_mask.min(), tgt_mask.max(), tgt_mask.dtype)
+        print(src_padding_mask.shape, src_padding_mask.dtype, src_padding_mask.sum())
+
+
         # --- ADDED flush=True to all prints in this block ---
         if i == 0 and epoch == 1:
             print("\n--- Checking Masks (Batch 0) ---", flush=True)
@@ -507,8 +577,11 @@ def train_epoch(model, dataloader, optimizer, criterion, pad_idx, clip_value):
             print(f"--- End Mask Checks ---", flush=True)
 
         optimizer.zero_grad()
+        print("tgt_mask:", tgt_mask.shape, tgt_mask.dtype, torch.unique(tgt_mask)[:5])
+        print("src_padding_mask:", src_padding_mask.shape, src_padding_mask.dtype, f"pad_count={src_padding_mask.sum().item()}/{src_padding_mask.numel()}")
 
         logits = model(src, tgt_mask=tgt_mask, src_padding_mask=src_padding_mask)
+
 
         # --- ADD THIS CHECK ---
         if torch.isnan(logits).any() or torch.isinf(logits).any():
@@ -606,6 +679,8 @@ if __name__ == "__main__":
         max_seq_len=MAX_SEQ_LEN
     ).to(DEVICE)
 
+    model.apply(init_weights) # Initialize weights
+
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX) # Ignore padding in loss calculation
     optimizer = optim.AdamW(model.parameters(), lr=LR) # Use the initial LR (e.g., 1e-5 if you lowered it)
 
@@ -647,6 +722,8 @@ if __name__ == "__main__":
 
     # --- 4. Training Loop ---
     print("Starting Training...")
+
+    all_epoch_losses = []
     global_step = 0 # Keep track of total optimizer steps
     for epoch in range(1, NUM_EPOCHS + 1):
 
@@ -728,6 +805,8 @@ if __name__ == "__main__":
 
             # --- Logging ---
             total_loss += loss.item()
+
+            
             # Update tqdm description with current loss and LR
             current_lr = scheduler.get_last_lr()[0] # Get current LR from scheduler
             batch_iterator.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{current_lr:.6f}"})
@@ -738,6 +817,7 @@ if __name__ == "__main__":
             avg_loss = total_loss / num_batches
             final_lr_epoch = scheduler.get_last_lr()[0]
             print(f"Epoch {epoch}/{NUM_EPOCHS} Summary: Average Training Loss: {avg_loss:.4f}, Final LR for Epoch: {final_lr_epoch:.8f}")
+            all_epoch_losses.append(avg_loss) # Store loss for later analysis
         else:
             print(f"Epoch {epoch}/{NUM_EPOCHS} Summary: No batches processed.")
             avg_loss = float('nan') # Assign NaN if no batches were processed
@@ -781,6 +861,25 @@ if __name__ == "__main__":
 
     print("Training Finished.")
     # --- 6. Save Final Model State Dict (Optional) ---
+
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(1, len(all_epoch_losses) + 1), all_epoch_losses, marker='o')
+        plt.title("Training Loss per Epoch")
+        plt.xlabel("Epoch")
+        plt.ylabel("Average Cross-Entropy Loss")
+        plt.grid(True)
+        plot_filename = "training_loss_plot.png"
+        plt.savefig(plot_filename)
+        print(f"Training loss plot saved to {plot_filename}")
+        # plt.show() # Optional: display plot if running interactively
+    except ImportError:
+        print("matplotlib not found. Skipping plot generation. Install with: pip install matplotlib")
+    except Exception as e:
+        print(f"Error generating plot: {e}")
+
+        
     try:
         torch.save(model.state_dict(), MODEL_SAVE_PATH)
         print(f"Final model state_dict saved to {MODEL_SAVE_PATH}")
